@@ -185,6 +185,8 @@ def _create_hisparse_host_events(
 class HiSparseConnectorWorker:
     """Own HiSparse host/hot state and execute its worker-side transfers."""
 
+    _defer_decode_row_mirror: bool = False
+
     def __init__(self, vllm_config: VllmConfig, kv_cache_config: KVCacheConfig) -> None:
         self.backend = get_hisparse_backend()
         self.vllm_config = vllm_config
@@ -402,9 +404,15 @@ class HiSparseConnectorWorker:
         request_state_indices: torch.Tensor | None,
         request_ids: list[str] | None = None,
         num_tokens: int = 0,
+        *,
+        defer_decode_row_mirror: bool = False,
     ) -> None:
-        self._stage_row_mirror_mapping(num_tokens)
+        if not defer_decode_row_mirror:
+            self._stage_row_mirror_mapping(num_tokens)
         self._finish_previous_step()
+        # This controls current row mirrors only. Previous draft and whole-page
+        # transfers keep their existing event and ownership protocol.
+        self._defer_decode_row_mirror = defer_decode_row_mirror
         previous_host_write_event = self.host_write_event
         self.host_write_event = self.host_write_events[self._next_host_write_event]
         self._next_host_write_event ^= 1
@@ -692,7 +700,11 @@ class HiSparseConnectorWorker:
 
     def _enqueue_layer_mirror(self, layer_index: int) -> None:
         handle = self.cache_handles[layer_index]
-        if not self._in_step or not handle.host_mirror_required:
+        if (
+            not self._in_step
+            or self._defer_decode_row_mirror
+            or not handle.host_mirror_required
+        ):
             return
         if layer_index in self._per_layer_mirrored:
             raise RuntimeError(f"HiSparse layer {layer_index} mirrored twice.")
@@ -853,6 +865,8 @@ class HiSparseConnectorWorker:
         self,
         ready_event: torch.Event | None = None,
     ) -> None:
+        if self._defer_decode_row_mirror:
+            return
         active = [
             (index, handle)
             for index, handle in enumerate(self.cache_handles)
